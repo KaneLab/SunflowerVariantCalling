@@ -1,0 +1,124 @@
+#!/bin/bash
+#PBS -q condo05
+#PBS -N GATK4.6.0_generateGVCFs
+#PBS -l select=1:ncpus=53:mem=477gb
+#PBS -l walltime=168:00:00
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -j oe
+
+#Pipeline for calling variants on many samples with GATK, using parallelization.
+#Author: Brian Smart and Kyle Keepers
+#Date: September 3, 2024
+
+#Required: Fastqs must be uniquely named and end with 1.f*q.gz and 2.f*q.gz. All samples to be processed in this pipeline must be in a single folder whose path is specified as an argument when submitting the job (along with output and sequencing platform)
+
+#Required programs:
+##fastp (https://github.com/OpenGene/fastp, or try ("conda install -c bioconda fastp")
+##bwamem2 (https://github.com/bwa-mem2/bwa-mem2)
+##samtools (https://www.htslib.org/download/)
+##gatk (https://github.com/broadinstitute/gatk/releases)
+##GNU parallel (https://www.gnu.org/software/parallel/)
+
+# Check if the required environment variables are provided
+if [ -z "$FASTQ_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$PL" ]; then
+    echo "Error: Missing required environment variables."
+    echo "Usage: qsub -v FASTQ_DIR=/path/to/fastqs,OUTPUT_DIR=/path/to/output,PL=platform generate412GVCFs.pbs"
+    exit 1
+fi
+
+# Set directories and PL from environment variables
+pathToFastqs=$FASTQ_DIR
+outputDir=$OUTPUT_DIR
+platform=$PL
+
+# Create output directory if it doesn't exist
+mkdir -p $outputDir
+cd $outputDir
+
+#Set these variables before running:
+threads=53
+
+#Locations of programs
+module load gatk/4.6.0
+module load parallel
+module load samtools/1.20
+module load bcftools/1.20
+pathToFastp=/mmfs1/projects/brent.hulke/Software/fastp #INCLUDE EXECUTABLE IN PATH
+pathTobwamem2=/mmfs1/projects/brent.hulke/Software/bwa-mem2/bwa-mem2 #INCLUDE EXECUTABLE IN PATH
+
+#Locations of files
+pathToBED=/mmfs1/projects/brent.hulke/sunflower_reference_genomes/HA412HOv2_w_CPMT/Ha412HOv2_w_CPMT_split53.fa.bed #INCLUDE FILE IN PATH
+pathToReference=/mmfs1/projects/brent.hulke/sunflower_reference_genomes/HA412HOv2_w_CPMT/Ha412HOv2_w_CPMT.fa #INCLUDE FILE IN PATH
+FileListCopy=/mmfs1/projects/brent.hulke/sunflower_reference_genomes/HA412HOv2_w_CPMT/FileListCopy #INCLUDE FILE IN PATH
+
+# Check if required files and executables exist
+for file in "$pathToReference" "$pathToBED" "$pathToFastp" "$pathTobwamem2" "$FileListCopy"; do
+    if [ ! -e "$file" ]; then
+        echo "Error: $file not found. Exiting."
+        exit 1
+    fi
+done
+
+#Index reference in proprietary bwa-mem2 format, if not done already
+if [[ ! -f ${pathToReference}.bwt.2bit.64 ]]; then
+    $pathTobwamem2 index $pathToReference
+else
+    echo "Reference is already indexed in bwa-mem2 format. Skipping indexing step."
+fi
+
+#Get sample prefixes
+ls $pathToFastqs/*q.gz | awk '{print $NF}' | sed 's@'"$pathToFastqs"'@@g' | sed 's/\///g' | sed 's/_[12]\.f*q\.gz//g' | sort | uniq > SamplePrefixes
+
+##########################Step 1: Generate indexed alignment maps##########################
+while read sample; do
+    #Create a readgroup string to be added in the read-alignment step
+    rg_string="@RG\tID:$sample\tLB:$sample\tPL:$platform\tSM:$sample"
+
+    #Perform automated read quality control filtering
+    $pathToFastp -i $pathToFastqs/${sample}*1.f*q.gz -I $pathToFastqs/${sample}*2.f*q.gz --stdout | \
+    $pathTobwamem2 mem -p -R "$rg_string" -t $threads $pathToReference - | \
+    samtools view -bhu - | \
+    samtools collate -@ $threads -O - | \
+    samtools fixmate -@ $threads -m - - | \
+    samtools sort -@ $threads - | \
+    samtools markdup -@ $threads - ${sample}.sorted.bam
+    rm fastp.html; rm fastp.json
+
+    #Index the completed alignment map
+    samtools index ${sample}.sorted.bam
+
+done < SamplePrefixes
+
+##########################Step 2: Call variants in individuals##########################
+while read sample; do
+    YOUR_BAM=$sample
+    CONTIGS=$pathToBED
+
+    # A function for bcftools where samtools view extracts only the indicated regions:
+    # Modified from the thread at https://www.biostars.org/p/418748/
+    function CALL_HAPLOTYPES {
+        BAM=$1
+        REGION=$2
+        GATK=$3
+        REF=$4
+        gatk HaplotypeCaller --java-options "-Xmx9G -Xms9G" --native-pair-hmm-threads 1 --intervals $REGION --input ${BAM}.sorted.bam --output output_fromBAM_${BAM}_region_${REGION}.vcf.gz --reference $REF -ERC GVCF
+    }
+    export -f CALL_HAPLOTYPES
+
+    #Take each region in the .bed input file and send it through the CALL_HAPLOTYPES function with its own thread
+    cat $CONTIGS | awk '{print $1":"$2"-"$3}' | parallel --will-cite -j $threads "CALL_HAPLOTYPES ${YOUR_BAM} {} gatk $pathToReference"
+
+    #Create a list of split .vcf.gz in the correct order to concatenate into the final whole-genome vcf.
+    sed "s/QQQQQ/${YOUR_BAM}/g" $FileListCopy > FileList
+
+    ## Concatenate everything using the FileList
+    bcftools concat --file-list FileList -O z > concat_fromBAM_${YOUR_BAM}.g.vcf.gz
+
+    ## remove temporary files:
+    rm output_fromBAM_${YOUR_BAM}_region_*.vcf.gz*; rm FileList
+
+    #Index the gVCF file
+    gatk IndexFeatureFile --input concat_fromBAM_${sample}.g.vcf.gz
+done < SamplePrefixes
+
+echo "Variant calling pipeline completed for all samples."
