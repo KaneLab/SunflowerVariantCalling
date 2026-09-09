@@ -1,0 +1,71 @@
+#!/bin/bash
+#PBS -N fastq_convert_concat
+#PBS -q default
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -J 1-1
+# Set -J to the number of lines in GENLIST before submitting.
+# Tip: n=$(wc -l < /path/to/GENLIST.txt) && qsub -J 1-$n ...
+#
+# STORAGE / CHUNKING NOTE:
+#   Each array job converts all SRRs for ONE genotype serially, then concatenates.
+#   Temporary uncompressed FASTQs go to $SCRATCH (separate quota from project storage).
+#   To chunk a large run, pass a subset GENLIST (e.g., lines 1-50) and set -J accordingly:
+#     head -50 GENLIST.txt > GENLIST_chunk1.txt
+#     qsub -J 1-50 -v "GENLIST=GENLIST_chunk1.txt,..." 02_fastq_convert_concat.pbs
+#   Jobs that find their output already complete will skip (safe to resubmit).
+
+# Converts SRA files to gzipped FASTQ and concatenates all runs per genotype.
+# Array is indexed by GENOTYPE (line in GENLIST), NOT by SRR.
+#
+# REQUIRED ARGS: MANIFEST, GENLIST, SRA_DIR, FASTQ_DIR, DRIVER
+#   MANIFEST  — tab-delimited SAMPLE_NAME<TAB>SRR_ID (from 00_prep_manifest.pbs or supplied manually)
+#   GENLIST   — unique SAMPLE_NAMEs, one per line
+#   SRA_DIR   — directory containing SRR subdirectories from 01_download_srr.pbs
+#   FASTQ_DIR — output directory for concatenated gzipped FASTQs
+#   DRIVER    — absolute path to 02_fastq_convert_concat_driver.sh
+#
+# OPTIONAL ARGS (passed via -v or exported before qsub):
+#   DELETE_SRA      — delete .sra files after successful FASTQ conversion (default: false)
+#   MIN_FREE_GB     — GB of headroom to require in FASTQ_DIR before each conversion (default: 100)
+#   INFLATION_FACTOR— multiplier on .sra file size to estimate peak uncompressed FASTQ size (default: 8)
+#
+# Usage:
+#   qsub -J 1-<N_GENOTYPES> \
+#        -v "MANIFEST=/path/MANIFEST.txt,GENLIST=/path/GENLIST.txt,\
+#            SRA_DIR=/path/sra,FASTQ_DIR=/path/fastq,\
+#            DRIVER=/path/02_fastq_convert_concat_driver.sh" \
+#        02_fastq_convert_concat.pbs
+#
+# Output files per genotype (in FASTQ_DIR):
+#   {SAMPLE}_{SRR1}[_{SRR2}...]_1.fastq.gz
+#   {SAMPLE}_{SRR1}[_{SRR2}...]_2.fastq.gz
+#
+# After all jobs complete, pass GENLIST and FASTQ_DIR to 03_trim_align_markdup.pbs.
+
+set -euo pipefail
+
+module load sratoolkit/3.2.1
+
+export DELETE_SRA="${DELETE_SRA:-false}"
+export MIN_FREE_GB="${MIN_FREE_GB:-100}"
+export INFLATION_FACTOR="${INFLATION_FACTOR:-8}"
+export NCPUS=8   # must match ncpus in select= line above
+
+GENOTYPE=$(sed -n "${PBS_ARRAY_INDEX}p" "$GENLIST")
+if [ -z "$GENOTYPE" ]; then
+    echo "No genotype at array index $PBS_ARRAY_INDEX in $GENLIST — nothing to do."
+    exit 0
+fi
+
+echo "Job $PBS_ARRAY_INDEX: $GENOTYPE — starting at $(date)"
+
+bash "$DRIVER" \
+    "$GENOTYPE" \
+    "$MANIFEST" \
+    "$SRA_DIR" \
+    "$FASTQ_DIR"
+
+echo "Job $PBS_ARRAY_INDEX: $GENOTYPE — finished at $(date)"

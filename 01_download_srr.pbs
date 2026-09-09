@@ -1,0 +1,47 @@
+#!/bin/bash
+#PBS -N download_srr
+#PBS -q default
+#PBS -l select=1:ncpus=1:mem=4gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -J 1-1
+# Set -J to the number of lines in SRR_LIST before submitting.
+# Tip: n=$(wc -l < /path/to/SRR_LIST.txt) && qsub -J 1-$n ...
+
+# Downloads SRA-format files from NCBI using prefetch, one SRR per array job.
+# Skips any SRR that already exists in SRA_DIR (safe to resubmit after partial runs).
+#
+# REQUIRED ARGS: SRR_LIST, SRA_DIR
+#   SRR_LIST — one SRR/ERR/DRR accession per line
+#   SRA_DIR  — directory where prefetch will write SRR subdirectories
+#
+# Usage:
+#   qsub -J 1-<N> -v "SRR_LIST=/path/to/SRR_LIST.txt,SRA_DIR=/path/to/sra" \
+#        01_download_srr.pbs
+#
+# After all jobs complete, submit 02_fastq_convert_concat.pbs.
+
+set -euo pipefail
+
+module load sratoolkit/3.2.1
+
+SRR_ID=$(sed -n "${PBS_ARRAY_INDEX}p" "$SRR_LIST")
+if [ -z "$SRR_ID" ]; then
+    echo "No SRR at array index $PBS_ARRAY_INDEX in $SRR_LIST — nothing to do."
+    exit 0
+fi
+
+echo "Job $PBS_ARRAY_INDEX: $SRR_ID — starting at $(date)"
+
+# Skip if already downloaded (supports resubmission after partial runs)
+shopt -s extglob nullglob
+existing=( "${SRA_DIR}/${SRR_ID}/${SRR_ID}".@(sra|sralite) )
+if [ "${#existing[@]}" -gt 0 ]; then
+    echo "$SRR_ID already present at ${existing[0]}, skipping."
+    exit 0
+fi
+
+mkdir -p "$SRA_DIR"
+prefetch --max-size 100T --output-directory "$SRA_DIR" "$SRR_ID"
+echo "Job $PBS_ARRAY_INDEX: $SRR_ID — finished at $(date)"

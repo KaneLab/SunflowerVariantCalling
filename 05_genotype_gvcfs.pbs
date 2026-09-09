@@ -1,0 +1,83 @@
+#!/bin/bash
+#PBS -N GenomicsDBImport_GenotypeGVCFs
+#PBS -q default
+#PBS -l select=1:ncpus=16:mem=125gb
+#PBS -l walltime=168:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -J 1-17
+# Array range is fixed at 1-17 (one job per chromosome). Do not change.
+
+# Runs GATK GenomicsDBImport + GenotypeGVCFs per chromosome to produce cohort VCFs.
+# One array job per chromosome; all samples are genotyped jointly.
+#
+# REQUIRED ARGS: SAMPLE_LIST, GVCF_DIR, COHORT, OUT_DIR
+#   SAMPLE_LIST — one sample/genotype ID per line (same GENLIST used throughout)
+#   GVCF_DIR    — directory of per-sample GVCFs from 04_haplotype_caller.pbs
+#                 Expected structure: GVCF_DIR/{chrom}/{sample}.{chrom}.g.vcf.gz
+#   COHORT      — cohort name string used in output file names (e.g. "OPV")
+#   OUT_DIR     — output directory for per-chromosome cohort VCFs
+#
+# Usage:
+#   qsub -J 1-17 \
+#        -v "SAMPLE_LIST=/path/GENLIST.txt,GVCF_DIR=/path/gvcf,COHORT=MyProject,OUT_DIR=/path/vcf" \
+#        05_genotype_gvcfs.pbs
+#
+# Outputs per chromosome in OUT_DIR:
+#   {COHORT}.{chrom}.vcf.gz
+#
+# After all 17 jobs complete, pass OUT_DIR, COHORT, and POP_LIST_DIR to 06_imputation.pbs.
+
+set -euo pipefail
+
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+ref=$GENOME_DIR/Ha412HOv2_w_CPMT.fa
+chromosomes=$GENOME_DIR/17_chromosomes_Ha412HOv2.list
+
+chrom=$(sed -n "${PBS_ARRAY_INDEX}p" "$chromosomes")
+sample_list=$SAMPLE_LIST
+gvcf_dir=$GVCF_DIR
+cohort=$COHORT
+out_dir=$OUT_DIR
+
+start=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $chrom — starting at $(date)"
+
+mkdir -p "$out_dir"
+module load gatk
+
+# Build the two-column sample map for this chromosome.
+# SAMPLE_LIST is single-column (genotype IDs); sample name and file identifier are the same.
+SAMPLE_MAP="$SCRATCH/${cohort}.${chrom}.sample_map"
+> "$SAMPLE_MAP"
+
+while IFS= read -r sample_name || [ -n "$sample_name" ]; do
+    [[ -z "$sample_name" ]] && continue
+    gvcf_file=$(find "$gvcf_dir/$chrom/" -name "${sample_name}*.g.vcf.gz" 2>/dev/null | head -n 1)
+    if [ -n "$gvcf_file" ]; then
+        printf '%s\t%s\n' "$sample_name" "$gvcf_file" >> "$SAMPLE_MAP"
+    else
+        echo "WARNING: No GVCF found for '$sample_name' on $chrom" >&2
+    fi
+done < "$sample_list"
+
+# GenomicsDBImport: consolidate per-sample GVCFs into a chromosome-level database
+gatk --java-options "-Xmx125g -XX:ParallelGCThreads=16" GenomicsDBImport \
+    --genomicsdb-workspace-path "$SCRATCH/${cohort}.${chrom}.gdb" \
+    --sample-name-map            "$SAMPLE_MAP" \
+    -L                           "$chrom" \
+    --tmp-dir                    "$SCRATCH" \
+    --reader-threads             16 \
+    --overwrite-existing-genomicsdb-workspace
+
+# GenotypeGVCFs: joint genotype across all samples
+gatk --java-options "-Xmx125g -XX:ParallelGCThreads=16" GenotypeGVCFs \
+    -R  "$ref" \
+    -V  "gendb://$SCRATCH/${cohort}.${chrom}.gdb" \
+    -L  "$chrom" \
+    --heterozygosity        0.01 \
+    --heterozygosity-stdev  0.1 \
+    -O  "$out_dir/${cohort}.${chrom}.vcf.gz"
+
+end=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $chrom — finished at $(date) ($(( end - start ))s)"

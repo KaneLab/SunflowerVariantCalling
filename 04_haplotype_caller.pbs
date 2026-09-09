@@ -1,0 +1,75 @@
+#!/bin/bash
+#PBS -N HaplotypeCaller
+#PBS -q default
+#PBS -l select=1:ncpus=17:mem=68gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -J 1-1
+# Set -J to the number of lines in SAMPLE_LIST before submitting.
+# Tip: n=$(wc -l < /path/to/GENLIST.txt) && qsub -J 1-$n ...
+
+# Runs GATK HaplotypeCaller in GVCF mode, one sample per array job.
+# All 17 chromosomes are processed in parallel within each job (GNU parallel).
+#
+# REQUIRED ARGS: SAMPLE_LIST, BAM_DIR, OUT_DIR
+#   SAMPLE_LIST — one sample/genotype ID per line (same list used for 03_trim_align_markdup.pbs)
+#   BAM_DIR     — directory containing {sample}.bam files from 03_trim_align_markdup.pbs
+#   OUT_DIR     — output directory for GVCFs
+#
+# Usage:
+#   qsub -J 1-<N> -v "SAMPLE_LIST=/path/GENLIST.txt,BAM_DIR=/path/bam,OUT_DIR=/path/gvcf" \
+#        04_haplotype_caller.pbs
+#
+# Outputs per sample in OUT_DIR:
+#   {chrom}/{sample}.{chrom}.g.vcf.gz  (one subdirectory per chromosome)
+#
+# After all jobs complete, pass SAMPLE_LIST, OUT_DIR, and a COHORT name to
+# 05_genotype_gvcfs.pbs.
+
+set -euo pipefail
+
+TMPDIR=$SCRATCH
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+ref=$GENOME_DIR/Ha412HOv2_w_CPMT.fa
+repeats=$GENOME_DIR/helianthusannuus.filteredRepeats.17_chromosomes.bed
+chromosomes=$GENOME_DIR/17_chromosomes_Ha412HOv2.list
+
+sample_list=$SAMPLE_LIST
+sample=$(sed -n "${PBS_ARRAY_INDEX}p" "$sample_list")
+if [ -z "$sample" ]; then
+    echo "No sample at array index $PBS_ARRAY_INDEX in $sample_list — nothing to do."
+    exit 0
+fi
+
+bam_dir=$BAM_DIR
+out_dir=$OUT_DIR
+
+start=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $sample — starting at $(date)"
+
+mkdir -p "$out_dir"
+module load gatk; module load parallel
+
+# Run HaplotypeCaller per chromosome in parallel (one thread per chrom)
+call_variants_per_chrom() {
+    local chrom=$1
+    mkdir -p "$out_dir/$chrom"
+    gatk HaplotypeCaller \
+        -R  "$ref" \
+        -I  "$bam_dir/$sample.bam" \
+        --intervals              "$chrom" \
+        --exclude-intervals      "$repeats" \
+        --emit-ref-confidence    GVCF \
+        --heterozygosity         0.01 \
+        --heterozygosity-stdev   0.1 \
+        --native-pair-hmm-threads 1 \
+        -O  "$out_dir/$chrom/$sample.$chrom.g.vcf.gz"
+}
+
+export -f call_variants_per_chrom
+export TMPDIR ref sample bam_dir out_dir repeats
+cat "$chromosomes" | parallel -j 17 call_variants_per_chrom
+
+end=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $sample — finished at $(date) ($(( end - start ))s)"

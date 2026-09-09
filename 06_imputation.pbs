@@ -1,0 +1,124 @@
+#!/bin/bash
+#PBS -N imputation
+#PBS -q default
+#PBS -l select=1:ncpus=16:mem=125gb
+#PBS -l walltime=168:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+
+# Concatenates per-chromosome VCFs, splits by population, runs BEAGLE 5.5 imputation,
+# and filters to biallelic SNPs. Cleans up large intermediate files on completion.
+#
+# REQUIRED ARGS: VCF_DIR, COHORT, POP_LIST_DIR, OUT_DIR
+#   VCF_DIR      — directory containing {COHORT}.{chrom}.vcf.gz from 05_genotype_gvcfs.pbs
+#   COHORT       — cohort name string (must match what was used in 05_genotype_gvcfs.pbs)
+#   POP_LIST_DIR — directory of population sample-list files (one .txt per population,
+#                  each containing one sample ID per line; filename becomes pop name)
+#   OUT_DIR      — output directory for all results
+#
+# OPTIONAL ARGS:
+#   BEAGLE_JAR   — path to BEAGLE 5.5 jar (default: set in site_config.sh; override via -v BEAGLE_JAR=...)
+#   N_THREADS    — threads for BEAGLE and bcftools (default: 16)
+#   MEM_GB       — Java heap for BEAGLE in GB (default: 120)
+#
+# Usage:
+#   qsub -v "VCF_DIR=/path/vcf,COHORT=MyProject,POP_LIST_DIR=/path/pops,OUT_DIR=/path/out" \
+#        06_imputation.pbs
+#
+# Outputs per population in OUT_DIR:
+#   {COHORT}.{POP_NAME}.imputed.biallelic_snps.vcf.gz  (+ .tbi index)
+#
+# Intermediate files (concat VCF, per-pop raw VCF, unfiltered imputed VCF) are
+# deleted at the end of the script to reclaim storage.
+
+set -euo pipefail
+
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+module load bcftools/1.20
+N_THREADS="${N_THREADS:-16}"
+MEM_GB="${MEM_GB:-120}"
+
+start_time=$(date +%s)
+echo "imputation starting at $(date)"
+echo "  VCF_DIR:      $VCF_DIR"
+echo "  COHORT:       $COHORT"
+echo "  POP_LIST_DIR: $POP_LIST_DIR"
+echo "  OUT_DIR:      $OUT_DIR"
+
+mkdir -p "$OUT_DIR"
+
+###############################################################################
+# Step 1: Concatenate per-chromosome VCFs into one genome-wide VCF
+###############################################################################
+echo ""
+echo "STEP 1: Concatenating chromosome VCFs for cohort '$COHORT' ..."
+CONCAT_VCF="${OUT_DIR}/${COHORT}.all_chroms.raw.vcf.gz"
+
+# ls -v gives version-sort, preserving chromosome numerical order
+ls -v "${VCF_DIR}/${COHORT}".*.vcf.gz > "${OUT_DIR}/vcf_list.txt"
+
+bcftools concat \
+    --threads "$N_THREADS" \
+    -f "${OUT_DIR}/vcf_list.txt" \
+    -a \
+    -Oz -o "$CONCAT_VCF"
+bcftools index -t "$CONCAT_VCF"
+echo "Concatenation complete: $CONCAT_VCF"
+
+###############################################################################
+# Step 2: Per-population imputation and filtering
+###############################################################################
+if [ ! -d "$POP_LIST_DIR" ] || [ -z "$(ls -A "${POP_LIST_DIR}"/*.txt 2>/dev/null)" ]; then
+    echo "ERROR: POP_LIST_DIR '$POP_LIST_DIR' is missing or contains no .txt files." >&2
+    echo "  Create one .txt file per population, each with one sample ID per line." >&2
+    exit 1
+fi
+
+echo ""
+echo "STEP 2: Per-population imputation ..."
+
+for pop_file in "${POP_LIST_DIR}"/*.txt; do
+    POP_NAME=$(basename "$pop_file" .txt)
+    echo "----------------------------------------------------"
+    echo "Population: $POP_NAME"
+
+    # a) Subset the genome-wide VCF to this population's samples
+    POP_VCF_RAW="${OUT_DIR}/${COHORT}.${POP_NAME}.raw.vcf.gz"
+    echo "  Subsetting VCF for $POP_NAME ..."
+    bcftools view -S "$pop_file" --threads "$N_THREADS" -Oz -o "$POP_VCF_RAW" "$CONCAT_VCF"
+    bcftools index -t "$POP_VCF_RAW"
+
+    # b) BEAGLE 5.5 phasing and imputation
+    IMPUTED_PREFIX="${OUT_DIR}/${COHORT}.${POP_NAME}.imputed"
+    echo "  Running BEAGLE 5.5 ..."
+    java -Xmx${MEM_GB}g -jar "$BEAGLE_JAR" \
+        gt="$POP_VCF_RAW" \
+        out="$IMPUTED_PREFIX" \
+        nthreads="$N_THREADS"
+
+    # c) Filter to biallelic SNPs
+    FINAL_VCF="${OUT_DIR}/${COHORT}.${POP_NAME}.imputed.biallelic_snps.vcf.gz"
+    echo "  Filtering to biallelic SNPs ..."
+    bcftools view \
+        -m2 -M2 -v snps \
+        --threads "$N_THREADS" \
+        -Oz -o "$FINAL_VCF" "${IMPUTED_PREFIX}.vcf.gz"
+    bcftools index -t "$FINAL_VCF"
+    echo "  Done: $FINAL_VCF"
+done
+
+###############################################################################
+# Step 3: Clean up large intermediate files
+###############################################################################
+echo ""
+echo "STEP 3: Cleaning up intermediate files ..."
+rm -f "$CONCAT_VCF" "${CONCAT_VCF}.tbi"
+rm -f "${OUT_DIR}"/*.raw.vcf.gz "${OUT_DIR}"/*.raw.vcf.gz.tbi
+rm -f "${OUT_DIR}"/*.imputed.vcf.gz "${OUT_DIR}"/*.imputed.vcf.gz.tbi
+rm -f "${OUT_DIR}"/*.imputed.log
+rm -f "${OUT_DIR}/vcf_list.txt"
+echo "Cleanup complete."
+
+end_time=$(date +%s)
+echo ""
+echo "Imputation workflow complete at $(date) ($(( end_time - start_time ))s total)"

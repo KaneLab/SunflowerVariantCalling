@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N trim_align_markdup
+#PBS -q condo05
+#PBS -l select=1:ncpus=32:mem=250gb
+#PBS -l walltime=168:00:00
+#PBS -j oe
+#PBS -W group_list=x-ccast-prj-hulke
+#PBS -J 1-1
+# Set -J to the number of lines in SAMPLE_LIST before submitting.
+# SAMPLE_LIST can be the GENLIST.txt from 00_prep_manifest.pbs (or your own sample ID list).
+# Tip: n=$(wc -l < /path/to/GENLIST.txt) && qsub -J 1-$n ...
+
+# Trims reads (fastp), aligns to reference (bwa-mem2), and marks duplicates (samtools markdup).
+# Produces one coordinate-sorted, indexed BAM per sample, plus QC reports.
+#
+# REQUIRED ARGS: SAMPLE_LIST, FQ_DIR, OUT_DIR
+#   SAMPLE_LIST — one sample/genotype ID per line (e.g. GENLIST.txt)
+#   FQ_DIR      — directory of concatenated FASTQs from 02_fastq_convert_concat.pbs
+#                 Files matched by glob: ${FQ_DIR}/${sample}_*1.fastq.gz (R1)
+#                                        ${FQ_DIR}/${sample}_*2.fastq.gz (R2)
+#   OUT_DIR     — output directory for BAMs and QC subdirectories
+#
+# Usage:
+#   qsub -J 1-<N> -v "SAMPLE_LIST=/path/GENLIST.txt,FQ_DIR=/path/fastq,OUT_DIR=/path/bam" \
+#        03_trim_align_markdup.pbs
+#
+# Outputs per sample in OUT_DIR:
+#   {sample}.bam, {sample}.bam.bai
+#   fastp_out/{sample}.{html,json}
+#   markdup_out/{sample}.stats
+#   mosdepth_out/{sample}.* (depth summary; no per-base bed)
+#   flagstat_out/{sample}.flagstat
+#
+# After all jobs complete, pass SAMPLE_LIST and OUT_DIR to 04_haplotype_caller.pbs.
+
+set -euo pipefail
+
+sample_list=$SAMPLE_LIST
+sample=$(sed -n "${PBS_ARRAY_INDEX}p" "$sample_list")
+if [ -z "$sample" ]; then
+    echo "No sample at array index $PBS_ARRAY_INDEX in $sample_list — nothing to do."
+    exit 0
+fi
+
+fq_dir=$FQ_DIR
+out_dir=$OUT_DIR
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+ref=$GENOME_DIR/Ha412HOv2_w_CPMT.fa
+software=$SOFTWARE_DIR
+
+start=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $sample — starting at $(date)"
+
+mkdir -p "$out_dir/fastp_out" "$out_dir/markdup_out" "$out_dir/mosdepth_out" "$out_dir/flagstat_out"
+
+module load samtools/1.20
+
+$software/fastp \
+    -i  "$fq_dir/${sample}"_*1.f*q.gz \
+    -I  "$fq_dir/${sample}"_*2.f*q.gz \
+    -h  "$out_dir/fastp_out/${sample}.html" \
+    -j  "$out_dir/fastp_out/${sample}.json" \
+    -w  16 \
+    --stdout \
+| $software/bwa-mem2/bwa-mem2 \
+    mem -p -R "@RG\tID:${sample}\tSM:${sample}" -t 16 "$ref" - \
+| samtools collate -@ 16 -O - \
+| samtools fixmate  -@ 16 -m - - \
+| samtools sort     -m 7G -@ 16 -T "$SCRATCH/${sample}" - \
+| samtools markdup  -@ 16 \
+    -f "$out_dir/markdup_out/${sample}.stats" \
+    - "$out_dir/${sample}.bam"
+
+samtools index "$out_dir/${sample}.bam"
+$software/mosdepth -t 16 --no-per-base "$out_dir/mosdepth_out/${sample}" "$out_dir/${sample}.bam"
+samtools flagstat -@ 16 "$out_dir/${sample}.bam" > "$out_dir/flagstat_out/${sample}.flagstat"
+
+end=$(date +%s)
+echo "Job $PBS_ARRAY_INDEX: $sample — finished at $(date) ($(( end - start ))s)"
