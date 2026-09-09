@@ -44,8 +44,9 @@ fi
 
 fq_dir=$FQ_DIR
 out_dir=$OUT_DIR
-ref=/mmfs1/projects/brent.hulke/sunflower_reference_genomes/HA412HOv2_w_CPMT/Ha412HOv2_w_CPMT.fa
-software=/mmfs1/projects/brent.hulke/software
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+ref=$GENOME_DIR/Ha412HOv2_w_CPMT.fa
+software=$SOFTWARE_DIR
 
 start=$(date +%s)
 echo "Job $PBS_ARRAY_INDEX: $sample — starting at $(date)"

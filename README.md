@@ -1,15 +1,28 @@
 # Sunflower Variant Calling Pipeline
 
-A PBS/Torque job scheduler pipeline for population-scale variant calling in sunflower (*Helianthus annuus*). Starting from NCBI SRA accessions, it produces imputed, population-stratified biallelic SNP sets ready for downstream analysis.
+> **Running SLURM or want automatic dependency tracking and failure recovery?**
+> See the [`snakemake` branch](../../tree/snakemake) for a Snakemake version of this pipeline that runs on both PBS/Torque and SLURM out of the box.
+
+A PBS/Torque job scheduler pipeline for population-scale variant calling in sunflower (*Helianthus annuus*). It produces imputed, population-stratified biallelic SNP sets ready for downstream analysis. The pipeline can start from NCBI SRA accessions **or** from paired-end FASTQs that already exist on the HPC.
 
 ## Pipeline Overview
 
-Seven scripts run in order. Each is a parameterized PBS job; all inputs are passed via `qsub -v` so no script needs to be edited between runs.
+Steps 03–06 are parameterized PBS jobs; all inputs are passed via `qsub -v` so no script needs to be edited between runs. Two entry points feed into step 03:
 
+**Path A — starting from NCBI SRA accessions:**
 ```
-00_prep_manifest    — query NCBI → MANIFEST.txt, GENLIST.txt, SRR_LIST.txt
-01_download_srr     — prefetch SRA files from NCBI (one job per SRR)
+00_prep_manifest        — query NCBI → MANIFEST.txt, GENLIST.txt, SRR_LIST.txt
+01_download_srr         — prefetch SRA files from NCBI (one job per SRR)
 02_fastq_convert_concat — convert SRA → FASTQ and concatenate runs per genotype (one job per genotype)
+  ↓
+```
+**Path B — starting from existing paired-end FASTQs:**
+```
+00_prep_local_fastq     — create symlinks + GENLIST.txt from a user-supplied FASTQ manifest (shell script, no job submission needed)
+  ↓
+```
+**Shared steps (both paths):**
+```
 03_trim_align_markdup   — fastp trim → bwa-mem2 align → samtools markdup → BAM (one job per sample)
 04_haplotype_caller     — GATK HaplotypeCaller in GVCF mode (one job per sample, 17 chroms in parallel)
 05_genotype_gvcfs       — GATK GenomicsDBImport + GenotypeGVCFs (one job per chromosome)
@@ -33,6 +46,27 @@ Seven scripts run in order. Each is a parameterized PBS job; all inputs are pass
 - BEAGLE 5.5 jar (path overridable via `BEAGLE_JAR=`)
 
 **Reference genome:** Ha412HOv2 with chloroplast and mitochondrial sequences (HA412HOv2_w_CPMT).
+
+## Porting to a New System
+
+All site-specific paths are consolidated in **`site_config.sh`**. Edit the three values there before running the pipeline on a new cluster — nothing else needs to change:
+
+```bash
+# site_config.sh
+GENOME_DIR=/path/to/HA412HOv2_w_CPMT    # reference genome directory
+SOFTWARE_DIR=/path/to/software           # fastp, bwa-mem2/, mosdepth, pigz
+BEAGLE_JAR=/path/to/beagle.jar          # BEAGLE 5.5 jar
+```
+
+All three can also be overridden per-submission without editing the file:
+```bash
+qsub -v "GENOME_DIR=/alt/ref,..." 04_haplotype_caller.pbs
+```
+
+**PBS scheduler settings** (`-q queue` and `-W group_list=`) are set in each script's `#PBS` header and can similarly be overridden at submission time:
+```bash
+qsub -q myqueue -W group_list=mygroup 03_trim_align_markdup.pbs
+```
 
 ## Input Files
 
@@ -90,6 +124,31 @@ qsub -v "VCF_DIR=/path/to/vcf,COHORT=MyProject,\
 
 To test a single sample before a full run, override the array range: `qsub -J 1-1 -v ...`
 
+## Quick Start — local FASTQs (Path B)
+
+If paired-end FASTQs already exist on the HPC, skip steps 00–02. Instead:
+
+**1. Create a manifest** (tab-delimited, one sample per line):
+```
+# SAMPLE_NAME	R1_PATH	R2_PATH
+HA89	/path/to/HA89_R1.fastq.gz	/path/to/HA89_R2.fastq.gz
+HA412	/path/to/HA412_L001_R1_001.fastq.gz	/path/to/HA412_L001_R2_001.fastq.gz
+```
+Lines beginning with `#` and blank lines are ignored. Absolute paths are recommended. Source files may follow any naming convention; the script normalises them.
+
+**2. Run the prep script:**
+```bash
+bash 00_prep_local_fastq.sh /path/to/manifest.tsv /path/to/fastq_dir /path/to/list_dir
+```
+
+**3. Continue with steps 03–06 as normal** (the script prints the exact `qsub` command):
+```bash
+N=$(wc -l < /path/to/list_dir/GENLIST.txt)
+qsub -J 1-$N \
+     -v "SAMPLE_LIST=/path/to/list_dir/GENLIST.txt,FQ_DIR=/path/to/fastq_dir,OUT_DIR=/path/to/bam" \
+     03_trim_align_markdup.pbs
+```
+
 ## Script Details
 
 ### 00_prep_manifest.pbs
@@ -98,6 +157,16 @@ Queries NCBI for sample metadata and builds the manifest files needed by downstr
 **Args:** `INPUT`, `INPUT_TYPE` (`srr` or `bioproject`), `OUT_DIR`  
 **Optional:** `EMAIL` (NCBI queries; default: `joseph.barham@ndsu.edu`)  
 **Outputs:** `MANIFEST.txt`, `GENLIST.txt`, `SRR_LIST.txt`
+
+---
+
+### 00_prep_local_fastq.sh *(alternative to steps 00–02)*
+Creates symlinks in `FASTQ_DIR` and writes `GENLIST.txt` from a user-supplied manifest of existing paired-end FASTQs. No job submission is needed — this is a lightweight shell script that runs on the login node. Source files may follow any naming convention; the symlinks are normalised to `{sample}_R1.{ext}` / `{sample}_R2.{ext}` so that `03_trim_align_markdup.pbs` picks them up without modification.
+
+**Args (positional):** `MANIFEST`, `FASTQ_DIR`, `LIST_DIR`  
+**Manifest format:** tab-delimited `SAMPLE_NAME<TAB>R1_PATH<TAB>R2_PATH`; `#` comment lines and blank lines are skipped  
+**Outputs:** symlinks in `FASTQ_DIR`, `{LIST_DIR}/GENLIST.txt`  
+**Note:** Source files must be gzip-compressed (`.fastq.gz` or `.fq.gz`); the script warns if uncompressed files are detected.
 
 ---
 

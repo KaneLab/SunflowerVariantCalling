@@ -17,7 +17,7 @@
 #   OUT_DIR      — output directory for all results
 #
 # OPTIONAL ARGS:
-#   BEAGLE_JAR   — path to BEAGLE 5.5 jar (default: see below)
+#   BEAGLE_JAR   — path to BEAGLE 5.5 jar (default: set in site_config.sh; override via -v BEAGLE_JAR=...)
 #   N_THREADS    — threads for BEAGLE and bcftools (default: 16)
 #   MEM_GB       — Java heap for BEAGLE in GB (default: 120)
 #
@@ -33,9 +33,8 @@
 
 set -euo pipefail
 
+source "$(dirname "$(realpath "$0")")/site_config.sh"
 module load bcftools/1.20
-
-BEAGLE_JAR="${BEAGLE_JAR:-/mmfs1/home/brian.smart/projects/software/beagle.27Feb25.75f.jar}"
 N_THREADS="${N_THREADS:-16}"
 MEM_GB="${MEM_GB:-120}"
 

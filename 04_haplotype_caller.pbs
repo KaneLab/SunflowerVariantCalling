@@ -30,10 +30,10 @@
 set -euo pipefail
 
 TMPDIR=$SCRATCH
-genome_dir=/mmfs1/projects/brent.hulke/sunflower_reference_genomes/HA412HOv2_w_CPMT
-ref=$genome_dir/Ha412HOv2_w_CPMT.fa
-repeats=$genome_dir/helianthusannuus.filteredRepeats.17_chromosomes.bed
-chromosomes=$genome_dir/17_chromosomes_Ha412HOv2.list
+source "$(dirname "$(realpath "$0")")/site_config.sh"
+ref=$GENOME_DIR/Ha412HOv2_w_CPMT.fa
+repeats=$GENOME_DIR/helianthusannuus.filteredRepeats.17_chromosomes.bed
+chromosomes=$GENOME_DIR/17_chromosomes_Ha412HOv2.list
 
 sample_list=$SAMPLE_LIST
 sample=$(sed -n "${PBS_ARRAY_INDEX}p" "$sample_list")
